@@ -1,134 +1,55 @@
-import { runSearchAgent } from './search_agent.js';
-import { runGapFillerAgent } from './gemini_gap_filler.js';
-import { runReasonerAgent } from '../gemini_client.js';
-import { logger } from './logger.js';
 import OpenAI from 'openai';
-import fs from 'fs';
-import path from 'path';
+import { logger } from '../utils/logger.js';
 import "dotenv/config";
 
 /**
- * @fileoverview Orquestador central del sistema de agentes legales.
- * Gestiona el flujo de trabajo coordinando a los agentes buscadores y al agente razonador.
+ * @fileoverview Rol: Jefe de Paralegales (Nebulon).
+ * Responsabilidades:
+ * 1. Resumir y sintetizar el contexto de investigación.
+ * 2. Extraer evidencia estructurada de textos legales crudos.
+ * 3. Coordinar a los investigadores (agentes).
+ * 
+ * Refinado para cumplir con los estándares de OpenRouter.
  */
 
-// --- Configuración de los Grupos de Agentes Buscadores ---
+// Usamos un modelo rápido y capaz de OpenRouter.
+// 'google/gemini-2.0-flash-exp:free' es una excelente opción por velocidad y ventana de contexto.
+const MODEL_NAME = "google/gemini-2.0-flash-exp:free";
 
-/**
- * Configuración de grupos de modelos de IA para los agentes buscadores.
- * Permite cambiar entre diferentes conjuntos de modelos para balancear costos, velocidad y calidad.
- * @constant {Object}
- */
-const SEARCHER_GROUPS = {
-  '1': [ // Grupo 1: Modelos Verificados (Optimizado)
-    // Agente 1: Grok Fast
-    { models: ["x-ai/grok-4.1-fast"] },
-    // Agente 2: GLM-4.5 Air (Reemplaza a Nemotron)
-    { models: ["z-ai/glm-4.5-air:free"] },
-    // Agente 3: Llama 3.3
-    { models: ["meta-llama/llama-3.3-70b-instruct:free"] },
-    // Agente 4: Kat Coder Pro
-    { models: ["kwaipilot/kat-coder-pro:free"] },
-  ],
-  '2': [ // Grupo 2: Respaldo (Configuración Usuario)
-    { models: ["meituan/longcat-flash-chat:free"] },
-    { models: ["openai/gpt-oss-20b:free"] },
-    { models: ["alibaba/tongyi-deepresearch-30b-a3b:free"] },
-    { models: ["google/gemini-2.0-flash-exp:free"] },
-  ]
+const OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
+const SITE_URL = "https://github.com/gemini-mcp"; // URL de referencia para el ranking de OpenRouter
+const SITE_NAME = "Gemini MCP Legal Agent";
+
+// --- CONFIGURACIÓN DE GRUPOS DE AGENTES (Regla Inmutable) ---
+export const SEARCHER_GROUPS = {
+    '1': [
+        { models: ["x-ai/grok-4.1-fast"] },
+        { models: ["z-ai/glm-4.5-air:free"] },
+        { models: ["meta-llama/llama-3.3-70b-instruct:free"] },
+        { models: ["kwaipilot/kat-coder-pro:free"] },
+    ],
+    '2': [
+        { models: ["meituan/longcat-flash-chat:free"] },
+        { models: ["openai/gpt-oss-20b:free"] },
+        { models: ["alibaba/tongyi-deepresearch-30b-a3b:free"] },
+        { models: ["google/gemini-2.0-flash-exp:free"] },
+    ]
 };
 
-
-// --- Definición de Prompts por Rol (sin cambios) ---
-
 /**
- * Instrucciones del sistema para los agentes buscadores.
- * Define el comportamiento estricto de búsqueda y uso de herramientas.
- * @constant {string}
+ * Crea una instancia configurada del cliente OpenAI para OpenRouter.
+ * @param {string} apiKey - Clave API de OpenRouter.
+ * @returns {OpenAI} Instancia del cliente.
  */
-const searcherSystemPrompt = `
-Eres un agente de búsqueda legal. Tu misión es encontrar leyes completas relevantes.
-Tienes acceso a dos herramientas. ÚSALAS en este orden lógico:
-
-1. "buscar_ley": Úsala PRIMERO para encontrar normas candidatas.
-   - Input: Palabras clave (ej: "Código Aguas", "Ley 19300").
-   - Output: Una lista de normas con sus IDs.
-
-2. "obtener_contenido_completo_ley": Úsala DESPUÉS de buscar, usando un ID encontrado.
-   - Input: El "idNorma" o "idLey" que obtuviste en el paso anterior.
-   - Output: El texto completo de la ley.
-
-REGLAS DE OPERACIÓN (Temperatura Baja):
-- NO inventes IDs. Usa solo los que te devuelva "buscar_ley".
-- Si "buscar_ley" falla o no da resultados, intenta con sinónimos o términos más generales.
-- Tu objetivo final es SIEMPRE llamar a "obtener_contenido_completo_ley" para descargar la evidencia.
-- NO respondas con texto conversacional. SOLO JSON.
-`;
-
-/**
- * Instrucciones del sistema para el agente razonador.
- * Define el tono empático y la estructura de la respuesta final.
- * @constant {string}
- */
-const reasonerSystemPrompt = `
-Eres un asesor legal virtual experto en legislación chilena (Gemini 3.0 Pro).
-Tu objetivo es analizar un volumen masivo de evidencia legal y generar una respuesta estructurada y completa.
-
-TU TAREA:
-1. Analiza el "Super Contexto" que incluye el requerimiento original, leyes completas y fuentes.
-2. Genera un JSON válido con la siguiente estructura EXACTA:
-
-\`\`\`json
-{
-  "original_requirement": "La consulta del usuario...",
-  "extensive_summary": "Resumen detallado y exhaustivo de la situación legal, cubriendo todos los ángulos...",
-  "fragments": [
-    { 
-      "text": "Cita textual relevante...", 
-      "source": "Nombre de la Ley / Artículo", 
-      "date": "Fecha de promulgación o vigencia (si está disponible)" 
-    }
-  ],
-  "concepts_searched": ["Concepto A", "Concepto B", "Concepto C"]
-}
-\`\`\`
-
-REGLAS:
-- El "extensive_summary" debe ser profundo y profesional.
-- "fragments" debe contener las citas textuales que respaldan tu resumen.
-- NO inventes leyes. Usa solo la evidencia provista.
-`;
-
-
-// --- Lógica del Orquestador con Selección de Grupo y Tolerancia a Fallos ---
-
-/**
- * Registra la interacción con Nebulon en un archivo de log dedicado.
- * @param {string} prompt - El prompt enviado al modelo.
- * @param {string} response - La respuesta recibida del modelo.
- */
-function logNebulonInteraction(prompt, response) {
-  const logDir = path.join(process.cwd(), 'logs');
-  if (!fs.existsSync(logDir)) {
-    fs.mkdirSync(logDir);
-  }
-
-  // Usar el timestamp de la sesión del logger principal para consistencia
-  const sessionTimestamp = logger.sessionTimestamp || new Date().toISOString().replace(/[:.]/g, '-');
-  const logFile = path.join(logDir, `nebulon_debug-${sessionTimestamp}.log`);
-  const timestamp = new Date().toISOString();
-
-  const logEntry = `
-=== INTERACCIÓN NEBULON [${timestamp}] ===
-[INPUT]
-${prompt}
-
-[OUTPUT]
-${response}
-=======================================
-`;
-
-  fs.appendFileSync(logFile, logEntry);
+function createOpenRouterClient(apiKey) {
+    return new OpenAI({
+        baseURL: OPENROUTER_BASE_URL,
+        apiKey: apiKey,
+        defaultHeaders: {
+            'HTTP-Referer': SITE_URL,
+            'X-Title': SITE_NAME,
+        },
+    });
 }
 
 /**
@@ -137,26 +58,24 @@ ${response}
  * @param {string} prevContext - El contexto acumulado hasta el momento.
  * @param {string} newEvidence - La nueva evidencia encontrada por el agente actual.
  * @param {string[]} apiKeys - Lista de claves API para rotación.
- * @returns {Promise<string>} El nuevo contexto resumido.
+ * @returns {Promise<Object>} El nuevo contexto resumido.
  */
-async function summarizeContext(query, prevContext, newEvidence, apiKeys) {
-  const model = "openrouter/bert-nebulon-alpha"; // Modelo ligero y gratuito
+export async function summarizeContext(query, prevContext, newEvidence, apiKeys) {
+    // Asegurar que newEvidence sea string
+    const evidenceText = typeof newEvidence === 'string' ? newEvidence : JSON.stringify(newEvidence);
 
-  // Asegurar que newEvidence sea string
-  const evidenceText = typeof newEvidence === 'string' ? newEvidence : JSON.stringify(newEvidence);
+    // Extraer IDs de leyes ya encontradas en la evidencia acumulada
+    const foundIds = [...evidenceText.matchAll(/Ley ID (\d+)/g)].map(m => m[1]);
+    const prevIds = (typeof prevContext === 'object' && prevContext.found_ids) ? prevContext.found_ids : [];
+    const allIds = [...new Set([...prevIds, ...foundIds])];
 
-  // Extraer IDs de leyes ya encontradas en la evidencia acumulada
-  const foundIds = [...evidenceText.matchAll(/Ley ID (\d+)/g)].map(m => m[1]);
-  const prevIds = (typeof prevContext === 'object' && prevContext.found_ids) ? prevContext.found_ids : [];
-  const allIds = [...new Set([...prevIds, ...foundIds])];
+    // Extraer el resumen de texto del contexto previo
+    const prevSummary = (typeof prevContext === 'object' && prevContext.resumen_actual)
+        ? prevContext.resumen_actual
+        : (prevContext || "Nada aún.");
 
-  // Extraer el resumen de texto del contexto previo (si es objeto) o usarlo directo si es string
-  const prevSummary = (typeof prevContext === 'object' && prevContext.resumen_actual)
-    ? prevContext.resumen_actual
-    : (prevContext || "Nada aún.");
-
-  const prompt = `
-  Eres un coordinador de investigación legal experto.
+    const prompt = `
+  Eres un coordinador de investigación legal experto (Jefe de Paralegales).
   
   CONSULTA DEL USUARIO: "${query}"
   
@@ -169,7 +88,7 @@ async function summarizeContext(query, prevContext, newEvidence, apiKeys) {
   
   NUEVOS HALLAZGOS (Agente Actual):
   """
-  ${newEvidence}
+  ${evidenceText}
   """
   
   TU TAREA:
@@ -191,42 +110,41 @@ async function summarizeContext(query, prevContext, newEvidence, apiKeys) {
   Responde SOLO con JSON válido.
   `;
 
-  for (const apiKey of apiKeys) {
-    try {
-      const openai = new OpenAI({
-        baseURL: 'https://openrouter.ai/api/v1',
-        apiKey: apiKey,
-        defaultHeaders: {
-          'HTTP-Referer': 'https://github.com/gemini-mcp',
-          'X-Title': 'Gemini MCP Legal Agent',
-        },
-      });
+    for (const apiKey of apiKeys) {
+        try {
+            const openai = createOpenRouterClient(apiKey);
 
-      const completion = await openai.chat.completions.create({
-        model: model,
-        messages: [{ role: "user", content: prompt }],
-        temperature: 0.2,
-        response_format: { type: "json_object" }
-      });
+            const completion = await openai.chat.completions.create({
+                model: MODEL_NAME,
+                messages: [{ role: "user", content: prompt }],
+                temperature: 0.2,
+                response_format: { type: "json_object" }
+            });
 
-      const responseContent = completion.choices[0].message.content;
-      logNebulonInteraction(prompt, responseContent);
+            const responseContent = completion.choices[0].message.content;
 
-      return JSON.parse(responseContent);
+            // Log detallado usando el nuevo logger
+            logger.logFullPayload('03_nebulon_audit.log', 'SUMMARIZE_CONTEXT', {
+                input: prompt,
+                output: responseContent
+            });
 
-    } catch (error) {
-      console.warn(`[Orquestador] ⚠️ Error al resumir contexto con Nebulon (Key ${apiKey.substring(0, 8)}...): ${error.message}`);
+            return JSON.parse(responseContent);
+
+        } catch (error) {
+            logger.warn(`[Nebulon] ⚠️ Error al resumir contexto (Key ${apiKey.substring(0, 8)}...): ${error.message}`);
+        }
     }
-  }
 
-  // Fallback en caso de error total
-  return {
-    resumen_actual: prevSummary + "\n" + newEvidence,
-    conceptos_faltantes: ["Desconocido"],
-    instruccion_busqueda: "Continúa buscando información relevante sobre la consulta.",
-    instruccion_corta: "Busca información relevante.",
-    restricciones_busqueda: "Ninguna."
-  };
+    // Fallback
+    return {
+        resumen_actual: prevSummary + "\n" + evidenceText,
+        conceptos_faltantes: ["Desconocido (Fallo Nebulon)"],
+        instruccion_busqueda: "Continúa buscando información relevante.",
+        instruccion_corta: "Busca información relevante.",
+        restricciones_busqueda: "Ninguna.",
+        found_ids: allIds
+    };
 }
 
 /**
@@ -234,18 +152,15 @@ async function summarizeContext(query, prevContext, newEvidence, apiKeys) {
  * @param {string} query - La consulta del usuario.
  * @param {string} rawEvidence - El texto crudo de la ley encontrada.
  * @param {string[]} apiKeys - Lista de claves API.
- * @returns {Promise<string>} Evidencia procesada y limpia.
+ * @returns {Promise<string>} Evidencia procesada y limpia (JSON String).
  */
-async function extractEvidence(query, rawEvidence, apiKeys) {
-  const model = "openrouter/bert-nebulon-alpha"; // Modelo eficiente para extracción
+export async function extractEvidence(query, rawEvidence, apiKeys) {
+    // Truncado de seguridad (1M caracteres)
+    const truncatedEvidence = rawEvidence.length > 1000000
+        ? rawEvidence.substring(0, 1000000) + "\n[...TRUNCADO POR SEGURIDAD (1M chars)...]"
+        : rawEvidence;
 
-  // Nebulon tiene un contexto de ~256k tokens (~1M caracteres).
-  // Ajustamos el límite de seguridad a 1.000.000 caracteres.
-  const truncatedEvidence = rawEvidence.length > 1000000
-    ? rawEvidence.substring(0, 1000000) + "\n[...TRUNCADO POR SEGURIDAD (1M chars)...]"
-    : rawEvidence;
-
-  const prompt = `
+    const prompt = `
   Eres un analista legal experto. Tu tarea es extraer información relevante de un texto legal crudo para responder a una consulta específica.
   
   CONSULTA DEL USUARIO: "${query}"
@@ -271,59 +186,52 @@ async function extractEvidence(query, rawEvidence, apiKeys) {
   Responde SOLO con el JSON válido.
   `;
 
-  for (const apiKey of apiKeys) {
-    try {
-      const openai = new OpenAI({
-        baseURL: 'https://openrouter.ai/api/v1',
-        apiKey: apiKey,
-        defaultHeaders: {
-          'HTTP-Referer': 'https://github.com/gemini-mcp',
-          'X-Title': 'Gemini MCP Legal Agent',
-        },
-      });
+    for (const apiKey of apiKeys) {
+        try {
+            const openai = createOpenRouterClient(apiKey);
 
-      const completion = await openai.chat.completions.create({
-        model: model,
-        messages: [{ role: "user", content: prompt }],
-        temperature: 0.1, // Bajo para precisión
-        response_format: { type: "json_object" }
-      });
+            const completion = await openai.chat.completions.create({
+                model: MODEL_NAME,
+                messages: [{ role: "user", content: prompt }],
+                temperature: 0.1,
+                response_format: { type: "json_object" }
+            });
 
-      const responseContent = completion.choices[0].message.content;
-      logNebulonInteraction(`[EXTRACCIÓN] ${prompt.substring(0, 200)}...`, responseContent);
+            const responseContent = completion.choices[0].message.content;
 
-      return responseContent;
+            logger.logFullPayload('03_nebulon_audit.log', 'EXTRACT_EVIDENCE', {
+                input: prompt.substring(0, 500) + "... [TRUNCATED]", // Log input truncado para no saturar
+                output: responseContent
+            });
 
-    } catch (error) {
-      console.warn(`[Orquestador] ⚠️ Error en extracción con Nebulon: ${error.message}`);
+            return responseContent;
+
+        } catch (error) {
+            logger.warn(`[Nebulon] ⚠️ Error en extracción: ${error.message}`);
+        }
     }
-  }
 
-  // Fallback: devolver un resumen manual si falla Nebulon
-  return JSON.stringify({
-    relevancia: "DESCONOCIDA (Fallo Nebulon)",
-    resumen: "No se pudo procesar la evidencia con IA. Se adjunta texto crudo truncado.",
-    citas_clave: [truncatedEvidence.substring(0, 1000) + "..."],
-    observaciones: "Error en procesamiento."
-  });
+    return JSON.stringify({
+        relevancia: "DESCONOCIDA (Fallo Nebulon)",
+        resumen: "No se pudo procesar la evidencia con IA. Se adjunta texto crudo truncado.",
+        citas_clave: [truncatedEvidence.substring(0, 1000) + "..."],
+        observaciones: "Error en procesamiento."
+    });
 }
 
 /**
- * Resume una ley completa utilizando Nebulon para prepararla para el Agente Razonador.
+ * Resume una ley completa utilizando Nebulon para prepararla para el Abogado Senior.
  * @param {string} lawText - El texto completo de la ley.
  * @param {string[]} apiKeys - Lista de claves API.
- * @returns {Promise<string>} El resumen detallado de la ley.
+ * @returns {Promise<Object>} El resumen detallado de la ley.
  */
-async function summarizeLawWithNebulon(lawText, apiKeys) {
-  const model = "openrouter/bert-nebulon-alpha"; // Usar el modelo designado como Nebulon
+export async function summarizeLaw(lawText, apiKeys) {
+    const truncatedText = lawText.length > 200000
+        ? lawText.substring(0, 200000) + "\n[...TRUNCADO...]"
+        : lawText;
 
-  // Truncar si es excesivamente largo para Nebulon (aunque se espera que maneje contextos razonables)
-  const truncatedText = lawText.length > 200000
-    ? lawText.substring(0, 200000) + "\n[...TRUNCADO...]"
-    : lawText;
-
-  const prompt = `
-  Eres un experto legal (Nebulon). Genera un resumen estructurado de esta ley para Gemini 3.0.
+    const prompt = `
+  Eres un experto legal (Nebulon). Genera un resumen estructurado de esta ley para el Abogado Senior.
   
   TEXTO:
   """
@@ -338,292 +246,30 @@ async function summarizeLawWithNebulon(lawText, apiKeys) {
   }
   `;
 
-  for (const apiKey of apiKeys) {
-    try {
-      const openai = new OpenAI({
-        baseURL: 'https://openrouter.ai/api/v1',
-        apiKey: apiKey,
-        defaultHeaders: { 'HTTP-Referer': 'https://github.com/gemini-mcp', 'X-Title': 'Gemini MCP Legal Agent' },
-      });
+    for (const apiKey of apiKeys) {
+        try {
+            const openai = createOpenRouterClient(apiKey);
 
-      const completion = await openai.chat.completions.create({
-        model: model,
-        messages: [{ role: "user", content: prompt }],
-        temperature: 0.4, // Temperatura ajustada a 0.4
-        response_format: { type: "json_object" }
-      });
+            const completion = await openai.chat.completions.create({
+                model: MODEL_NAME,
+                messages: [{ role: "user", content: prompt }],
+                temperature: 0.4,
+                response_format: { type: "json_object" }
+            });
 
-      const content = completion.choices[0].message.content;
-      logNebulonInteraction(`[RESUMEN JSON]`, content);
-      return JSON.parse(content); // Retornar objeto, no string
+            const content = completion.choices[0].message.content;
 
-    } catch (error) {
-      console.warn(`[Orquestador] ⚠️ Error Nebulon: ${error.message}`);
+            logger.logFullPayload('03_nebulon_audit.log', 'SUMMARIZE_LAW', {
+                input_length: truncatedText.length,
+                output: content
+            });
+
+            return JSON.parse(content);
+
+        } catch (error) {
+            logger.warn(`[Nebulon] ⚠️ Error al resumir ley: ${error.message}`);
+        }
     }
-  }
 
-  return { error: "Fallo al resumir", texto_parcial: lawText.substring(0, 1000) };
+    return { error: "Fallo al resumir", texto_parcial: lawText.substring(0, 1000) };
 }
-
-/**
- * Ejecuta el flujo principal de orquestación.
- * 1. Selecciona el grupo de agentes buscadores.
- * 2. Lanza las búsquedas en paralelo.
- * 3. Recopila y combina la evidencia encontrada.
- * 4. Envía la evidencia al agente razonador para generar la respuesta final.
- * 
- * @async
- * @param {string} userQuery - La consulta legal del usuario.
- * @param {string} [groupId='1'] - El ID del grupo de agentes a utilizar ('1' o '2').
- * @returns {Promise<string|undefined>} La respuesta final generada por el agente razonador, o undefined si hay errores críticos.
- */
-async function runOrchestrator(userQuery, groupId = '1') {
-  logger.startNewSession(); // Iniciar nuevo archivo de log para esta consulta
-  logger.info(`\n[Orquestador] 🚀 Iniciando Orquestador de Agentes Legales`);
-  logger.info(`[Orquestador] 📋 Consulta del usuario: "${userQuery}"`);
-  logger.info(`[Orquestador] 👥 Grupo de agentes seleccionado: ${groupId}`);
-  logger.info(`[Orquestador] 📁 Archivo de logs: ${logger.getLogFilePath()}`);
-
-  let selectedGroup = SEARCHER_GROUPS[groupId];
-  if (!selectedGroup) {
-    logger.error(`Error: El grupo de buscadores con ID '${groupId}' no existe. Usando Grupo 1 por defecto.`);
-    selectedGroup = SEARCHER_GROUPS['1'];
-  }
-
-  // Obtener API Keys del entorno (soporta lista separada por comas)
-  const envKeys = process.env.OPENROUTER_API_KEYS || process.env.OPENROUTER_API_KEY;
-  const apiKeys = envKeys ? envKeys.split(',').map(k => k.trim()).filter(k => k.length > 0) : [];
-
-  if (apiKeys.length === 0) {
-    logger.error("Error: No se encontraron claves API en OPENROUTER_API_KEYS o OPENROUTER_API_KEY.");
-    return;
-  }
-
-  logger.info(`[Orquestador] ${selectedGroup.length} agentes buscadores activos en el Grupo ${groupId}.`);
-
-  let evidenceList = []; // Array para acumular objetos de evidencia estructurada
-  let previousFindings = "";
-
-  // Ejecución Secuencial Colaborativa
-  for (let i = 0; i < selectedGroup.length; i++) {
-    const agentConfig = selectedGroup[i];
-    logger.info(`\n[Orquestador] 🚀 Desplegando Agente Buscador ${i + 1}/${selectedGroup.length} con modelos: ${agentConfig.models.join(", ")}`);
-
-    // Construir Prompt Dinámico con Contexto Previo
-    let currentSystemPrompt = searcherSystemPrompt;
-    let instruccionFinal = null;
-
-    // Si hay hallazgos previos (objeto JSON de Nebulon o string inicial)
-    if (previousFindings) {
-      const resumen = previousFindings.resumen_actual || previousFindings; // Manejar objeto o string
-      const instruccion = previousFindings.instruccion_busqueda || "";
-      const instruccionCorta = previousFindings.instruccion_corta || instruccion;
-      const restricciones = previousFindings.restricciones_busqueda || "";
-
-      // Detectar si es un modelo "pequeño" o propenso a fallar con instrucciones largas
-      // Asumimos que el Grupo 2 (Nemotron/Nano) se beneficia de instrucciones cortas
-      const isSmallModel = agentConfig.models.some(m => m.includes("nano") || m.includes("mobile"));
-      instruccionFinal = isSmallModel ? instruccionCorta : instruccion;
-
-      logger.info(`[Orquestador] 🧠 Inyectando contexto previo al Agente ${i + 1}...`);
-
-      currentSystemPrompt += `
-      
-      --- CONTEXTO DE COLABORACIÓN ---
-      
-      OBJETIVO FINAL: Responder a la consulta del usuario: "${userQuery}"
-      
-      ESTADO ACTUAL DE LA INVESTIGACIÓN:
-      Otros agentes ya han encontrado lo siguiente:
-      """
-      ${resumen}
-      """
-      `;
-
-      if (instruccionFinal) {
-        logger.info(`[Orquestador] 💡 Nebulon sugiere (${isSmallModel ? 'CORTA' : 'DETALLADA'}): "${instruccionFinal}"`);
-        currentSystemPrompt += `
-        ⚠️ INSTRUCCIÓN PRIORITARIA DEL COORDINADOR:
-        "${instruccionFinal}"
-        
-        ⛔ RESTRICCIONES (LO QUE YA TENEMOS):
-        "${restricciones}"
-        
-        Céntrate en cumplir la instrucción positiva y RESPETAR las restricciones.
-        `;
-      } else {
-        currentSystemPrompt += `
-        TU MISIÓN:
-        1. Analiza la consulta del usuario frente a la evidencia ya encontrada.
-        2. Detecta qué información CLAVE falta.
-        3. Busca EXCLUSIVAMENTE esa información faltante.
-        `;
-      }
-    }
-
-    try {
-      // --- LÓGICA DE AISLAMIENTO DE CONTEXTO ---
-      // Definir la instrucción activa (lo que el agente debe hacer AHORA)
-      let activeInstruction = userQuery; // Por defecto (primer agente) es la query original
-      if (instruccionFinal) {
-        activeInstruction = instruccionFinal; // Si Nebulon dio una orden, esa es la ley suprema
-      }
-
-      // Definir el contexto pasivo (referencia)
-      const contextData = {
-        originalQuery: userQuery
-      };
-
-      let result = await runSearchAgent(activeInstruction, contextData, currentSystemPrompt, agentConfig.models, apiKeys);
-
-      // --- LÓGICA DE FALLBACK ROBUSTO (SAFETY NET) ---
-      if (result.failed) {
-        logger.warn(`[Orquestador] ⚠️ Agente Principal ${i + 1} falló (4/4 keys). Iniciando Protocolo de Respaldo (Grupo 2)...`);
-
-        // Guardar evidencia parcial si existe
-        const partialEvidence = result.evidence;
-        if (partialEvidence) {
-          logger.info(`[Orquestador] 💾 Evidencia parcial preservada del Agente ${i + 1}.`);
-        }
-
-        // Obtener agentes de respaldo (Grupo 2)
-        const backupGroup = SEARCHER_GROUPS['2'];
-        let backupSuccess = false;
-
-        for (let j = 0; j < backupGroup.length; j++) {
-          const backupConfig = backupGroup[j];
-          logger.info(`[Orquestador] 🛡️ Activando Agente de Respaldo ${j + 1}/${backupGroup.length} (Modelos: ${backupConfig.models.join(", ")})...`);
-
-          const backupResult = await runSearchAgent(activeInstruction, contextData, currentSystemPrompt, backupConfig.models, apiKeys);
-
-          if (!backupResult.failed) {
-            logger.info(`[Orquestador] ✅ Agente de Respaldo ${j + 1} tuvo éxito. Recuperación completada.`);
-            result = backupResult; // Reemplazar resultado fallido con el exitoso
-            backupSuccess = true;
-            break; // Salir del bucle de respaldo
-          } else {
-            logger.warn(`[Orquestador] ❌ Agente de Respaldo ${j + 1} también falló.`);
-          }
-        }
-
-        if (!backupSuccess) {
-          logger.error(`[Orquestador] 💀 Todos los agentes de respaldo fallaron. Volviendo a evidencia parcial (si existe).`);
-          // Si todo falla, nos quedamos con la evidencia parcial del agente original (o string vacío)
-          result.evidence = partialEvidence || "";
-        }
-      }
-
-      if (result && result.evidence) {
-        logger.info(`[Orquestador] ✅ Evidencia recibida de ${result.model}.`);
-
-        // --- Resumir la ley con Nebulon (JSON) ---
-        logger.info(`[Orquestador] 🧠 Nebulon está estructurando la evidencia...`);
-        const evidenceObject = await summarizeLawWithNebulon(result.evidence, apiKeys);
-
-        // Agregar metadatos del agente fuente
-        evidenceObject.source_agent = result.model;
-        evidenceList.push(evidenceObject);
-
-        // Actualizar contexto usando Nebulon (para el bucle de búsqueda)
-        // Nota: summarizeContext espera texto, así que le pasamos el resumen del objeto
-        const textForContext = evidenceObject.resumen_detallado || JSON.stringify(evidenceObject);
-
-        logger.info(`[Orquestador] 🧠 Sintetizando contexto con Nebulon...`);
-        const summaryObj = await summarizeContext(userQuery, previousFindings, textForContext, apiKeys);
-        previousFindings = summaryObj;
-
-        logger.debug(`[Orquestador] 📝 Nuevo Contexto Resumido: ${JSON.stringify(previousFindings).substring(0, 200)}...`);
-
-      } else {
-        logger.warn(`[Orquestador] ⚠️ Agente ${i + 1} (y sus respaldos) no encontraron evidencia nueva.`);
-      }
-    } catch (err) {
-      logger.error(`[Orquestador] ❌ Error CRÍTICO en ciclo de Agente ${i + 1}: ${err.message}`);
-    }
-  }
-
-  /* 
-  // Lógica anterior paralela (comentada/reemplazada)
-  const searchPromises = selectedGroup.map(agentConfig => { ... });
-  const settlementResults = await Promise.allSettled(searchPromises);
-  ...
-  */
-
-  if (evidenceList.length === 0) {
-    logger.warn("[Orquestador] Ningún agente buscador encontró información relevante.");
-    return "Lo siento, no pude encontrar información relevante sobre tu consulta en la base de datos de Ley Chile.";
-  }
-
-  logger.info("\n--- [Orquestador] Evidencia Recopilada ---");
-  logger.info(`[Orquestador] 📊 Número de piezas de evidencia: ${evidenceList.length}`);
-  logger.debug(JSON.stringify(evidenceList[0]).substring(0, 500) + "...");
-  logger.info("--- [Orquestador] Fin de la Evidencia ---");
-
-  // --- FASE DE REFINAMIENTO (GAP FILLER) ---
-  // Bucle: Mientras Nebulon detecte conceptos faltantes, activamos al Gap Filler.
-  let gapFillerAttempts = 0;
-  const MAX_GAP_FILLER_ATTEMPTS = 5; // Límite de seguridad para evitar bucles infinitos
-
-  while (
-    previousFindings &&
-    previousFindings.conceptos_faltantes &&
-    previousFindings.conceptos_faltantes.length > 0 &&
-    gapFillerAttempts < MAX_GAP_FILLER_ATTEMPTS
-  ) {
-    gapFillerAttempts++;
-    logger.info(`\n[Orquestador] 🕵️ Activando Gap Filler (Ciclo ${gapFillerAttempts}/${MAX_GAP_FILLER_ATTEMPTS}). Conceptos: ${previousFindings.conceptos_faltantes.join(", ")}`);
-
-    const gapResult = await runGapFillerAgent(previousFindings.conceptos_faltantes, previousFindings, userQuery);
-
-    if (gapResult.evidence) {
-      logger.info(`[Orquestador] ✅ Gap Filler retornó evidencia. Actualizando Nebulon...`);
-
-      // Si Gap Filler retorna evidencia, también la resumimos y agregamos
-      const gapEvidenceObject = await summarizeLawWithNebulon(gapResult.evidence, apiKeys);
-      gapEvidenceObject.source_agent = `Gap Filler (Ciclo ${gapFillerAttempts})`;
-      evidenceList.push(gapEvidenceObject);
-
-      // Re-evaluar con Nebulon para ver si ya estamos completos
-      logger.info(`[Orquestador] 🧠 Re-evaluando completitud con Nebulon...`);
-      const textForContext = gapEvidenceObject.resumen_detallado || JSON.stringify(gapEvidenceObject);
-      const newSummary = await summarizeContext(userQuery, previousFindings, textForContext, apiKeys);
-      previousFindings = newSummary;
-
-      if (!previousFindings.conceptos_faltantes || previousFindings.conceptos_faltantes.length === 0) {
-        logger.info(`[Orquestador] 🎉 Nebulon indica que NO faltan conceptos. Refinamiento completado.`);
-        break;
-      }
-    } else {
-      logger.warn(`[Orquestador] ⚠️ Gap Filler no encontró nueva evidencia. Terminando refinamiento para evitar redundancia.`);
-      break;
-    }
-  }
-
-  logger.info("\n[Orquestador] Enviando evidencia a Gemini para la síntesis final...");
-
-  // --- CONSTRUCCIÓN DEL SUPER CONTEXTO (JSON String) ---
-  const superContext = JSON.stringify({
-    original_requirement: userQuery,
-    searched_concepts: previousFindings ? previousFindings.found_ids : [],
-    missing_concepts: previousFindings ? previousFindings.conceptos_faltantes : [],
-    evidence_collection: evidenceList
-  }, null, 2);
-
-  // Truncar si es necesario (aunque JSON stringificado es texto)
-  const truncatedContext = superContext.length > 300000
-    ? superContext.substring(0, 300000) + "\n...[TRUNCADO]..."
-    : superContext;
-
-
-  logger.info(`[Orquestador] 📦 Super Contexto preparado (${truncatedContext.length} caracteres).`);
-
-  const finalResponse = await runReasonerAgent(userQuery, reasonerSystemPrompt, truncatedContext);
-
-  logger.info("\n\n--- ASESORÍA LEGAL FINAL ---");
-  console.log(finalResponse);
-  logger.info("---------------------------\n");
-
-  return finalResponse;
-}
-
-export { runOrchestrator };
